@@ -1,0 +1,17 @@
+{
+    "system_prompt": "Transcribe the following audio:",
+    "samples": [
+        {
+            "audio_path": "/path/to/audio1.wav",
+            "text": "Hello, how are you today?"
+        },
+        {
+            "audio_path": "/path/to/audio2.wav",
+            "text": "The weather is beautiful outside."
+        },
+        {
+            "audio_path": "/path/to/audio3.wav",
+            "text": "Machine learning is transforming many industries."
+        }
+    ]
+}

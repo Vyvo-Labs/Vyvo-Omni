@@ -1,0 +1,12 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.36.0
+accelerate>=0.25.0
+datasets>=2.16.0
+soundfile>=0.12.0
+librosa>=0.10.0
+pyyaml>=6.0
+tqdm>=4.65.0
+tensorboard>=2.15.0
+wandb>=0.15.0
+torchcodec

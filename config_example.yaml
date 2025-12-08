@@ -1,0 +1,50 @@
+# VyvoOmni Training Configuration Example
+#
+# Single GPU:
+#   python train.py --config config_example.yaml
+#
+# Multi-GPU:
+#   accelerate launch --config_file accelerate_config.yaml train.py --config config_example.yaml
+#
+# Or with torchrun:
+#   torchrun --nproc_per_node=4 train.py --config config_example.yaml
+
+# Model Configuration
+llm_model: "Qwen/Qwen3-0.6B"
+whisper_model: "openai/whisper-large-v3"
+projection_layers: 2
+projection_dropout: 0.1
+use_flash_attention: true
+
+# Data Configuration
+data_path: "./data/train.json"
+eval_data_path: "./data/train_eval.json"
+max_audio_length: 30.0
+max_seq_length: 2048
+
+# Training Configuration
+output_dir: "./vyvo_omni_output"
+num_epochs: 3
+batch_size: 4  # Per GPU batch size
+eval_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 1e-4
+weight_decay: 0.01
+warmup_ratio: 0.1
+max_grad_norm: 1.0
+lr_scheduler: "cosine"
+
+# Precision (bf16 recommended for modern GPUs)
+bf16: true
+fp16: false
+
+# Logging and Saving
+logging_steps: 10
+save_steps: 500
+eval_steps: 500
+save_total_limit: 3
+
+# Misc
+seed: 42
+num_workers: 4
+gradient_checkpointing: true
