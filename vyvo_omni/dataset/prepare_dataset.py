@@ -31,7 +31,10 @@ TEXT_COLUMN = "transcript"  # Column containing transcription text
 # Output settings
 OUTPUT_DIR = "./data"  # Directory to save audio files and JSON
 OUTPUT_JSON = "train.json"  # Output JSON filename
-SYSTEM_PROMPT = "Transcribe the following audio:"  # Global system prompt
+
+# Task configuration (following OmniAudio format)
+TASK_TOKEN = "<|transcribe|>"  # Task token for transcription
+INSTRUCTION_TEXT = ""  # Empty instruction for transcription task
 
 # Audio settings
 TARGET_SAMPLE_RATE = 16000  # Whisper expects 16kHz
@@ -100,10 +103,12 @@ def process_dataset():
 
             sf.write(audio_path, audio_array, sample_rate)
 
-            # Add to samples
+            # Add to samples (OmniAudio format with task token)
             samples.append({
                 "audio_path": os.path.abspath(audio_path),
-                "text": text.strip(),
+                "task_token": TASK_TOKEN,
+                "instruction": INSTRUCTION_TEXT,
+                "response": text.strip(),
             })
 
         except Exception as e:
@@ -118,36 +123,36 @@ def process_dataset():
         train_samples = samples[:split_idx]
         eval_samples = samples[split_idx:]
 
-        # Save train JSON
+        # Save train JSON (OmniAudio format - no system_prompt field)
         train_data = {
-            "system_prompt": SYSTEM_PROMPT,
             "samples": train_samples,
         }
         train_json_path = os.path.join(OUTPUT_DIR, OUTPUT_JSON)
         with open(train_json_path, "w", encoding="utf-8") as f:
             json.dump(train_data, f, ensure_ascii=False, indent=2)
         print(f"Train JSON saved: {train_json_path} ({len(train_samples)} samples)")
+        print(f"  Using OmniAudio format with task token: {TASK_TOKEN}")
 
-        # Save eval JSON
+        # Save eval JSON (OmniAudio format - no system_prompt field)
         eval_data = {
-            "system_prompt": SYSTEM_PROMPT,
             "samples": eval_samples,
         }
         eval_json_path = os.path.join(OUTPUT_DIR, OUTPUT_JSON.replace(".json", "_eval.json"))
         with open(eval_json_path, "w", encoding="utf-8") as f:
             json.dump(eval_data, f, ensure_ascii=False, indent=2)
         print(f"Eval JSON saved: {eval_json_path} ({len(eval_samples)} samples)")
+        print(f"  Using OmniAudio format with task token: {TASK_TOKEN}")
 
     else:
-        # Save single JSON
+        # Save single JSON (OmniAudio format - no system_prompt field)
         data = {
-            "system_prompt": SYSTEM_PROMPT,
             "samples": samples,
         }
         json_path = os.path.join(OUTPUT_DIR, OUTPUT_JSON)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         print(f"JSON saved: {json_path} ({len(samples)} samples)")
+        print(f"  Using OmniAudio format with task token: {TASK_TOKEN}")
 
     print("\n" + "=" * 60)
     print("Dataset preparation complete!")
