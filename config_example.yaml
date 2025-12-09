@@ -25,8 +25,8 @@ max_seq_length: 2048
 # Training Configuration
 output_dir: "./vyvo_omni_output"
 num_epochs: 3
-batch_size: 4  # Per GPU batch size
-eval_batch_size: 4
+batch_size: 16  # Per GPU batch size
+eval_batch_size: 16
 gradient_accumulation_steps: 4
 learning_rate: 1e-4
 weight_decay: 0.01

@@ -132,14 +132,24 @@ class SpeechTextDataset(Dataset):
         )
         audio_features = audio_features.input_features.squeeze(0)
 
-        # Get text
-        text = sample["text"]
-        prompt = sample.get("prompt", self.system_prompt)
+        # Support both old (transcription) and new (conversational) formats
+        if "instruction" in sample and "response" in sample:
+            # New conversational format with task tokens
+            task_token = sample.get("task_token", "")
+            instruction = sample["instruction"]
+            response = sample["response"]
 
-        # Create input text with audio placeholder
-        # Format: <prompt> <audio_start> [AUDIO] <audio_end> <response>
-        input_text = f"{prompt}\n{self.audio_start_token}{self.audio_end_token}\n"
-        target_text = text
+            # Format: <task_token> <instruction> <audio_start> [AUDIO] <audio_end> <response>
+            input_text = f"{task_token} {instruction}\n{self.audio_start_token}{self.audio_end_token}\n"
+            target_text = response
+        else:
+            # Old transcription format (backward compatible)
+            text = sample["text"]
+            prompt = sample.get("prompt", self.system_prompt)
+
+            # Format: <prompt> <audio_start> [AUDIO] <audio_end> <response>
+            input_text = f"{prompt}\n{self.audio_start_token}{self.audio_end_token}\n"
+            target_text = text
 
         return {
             "audio_features": audio_features,

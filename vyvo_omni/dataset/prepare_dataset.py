@@ -35,7 +35,7 @@ SYSTEM_PROMPT = "Transcribe the following audio:"  # Global system prompt
 
 # Audio settings
 TARGET_SAMPLE_RATE = 16000  # Whisper expects 16kHz
-MAX_SAMPLES = 100000  # Limit number of samples (None = use all)
+MAX_SAMPLES = None  # Limit number of samples (None = use all)
 
 # Train/eval split
 EVAL_SPLIT_RATIO = 0.1  # Fraction for evaluation set (0.1 = 10%)

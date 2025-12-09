@@ -105,11 +105,16 @@ class VyvoOmniModel(nn.Module):
             trust_remote_code=True,
         )
 
-        # Add special tokens for audio boundaries
+        # Add special tokens for audio boundaries and tasks
         special_tokens = {
             "additional_special_tokens": [
                 config.audio_start_token,
                 config.audio_end_token,
+                config.transcribe_token,
+                config.summarize_token,
+                config.question_token,
+                config.describe_token,
+                config.chat_token,
             ]
         }
         num_added = self.tokenizer.add_special_tokens(special_tokens)
@@ -140,7 +145,12 @@ class VyvoOmniModel(nn.Module):
         self._freeze_components()
 
     def _freeze_components(self):
-        """Freeze Whisper and LLM, keep only projector trainable."""
+        """
+        Freeze components based on training stage.
+
+        Stage 1: Freeze Whisper + LLM, train projection only
+        Stage 2: Freeze Whisper + projection, train LLM only
+        """
         # Freeze Whisper encoder
         if self.config.freeze_whisper:
             self.whisper_encoder.eval()
@@ -151,17 +161,37 @@ class VyvoOmniModel(nn.Module):
         if self.config.freeze_llm:
             for param in self.llm.parameters():
                 param.requires_grad = False
+        else:
+            # LLM is trainable (Stage 2)
+            self.llm.train()
+            for param in self.llm.parameters():
+                param.requires_grad = True
 
-        # Audio projector remains trainable by default
+        # Freeze audio projector (Stage 2)
+        if self.config.freeze_projection:
+            self.audio_projector.eval()
+            for param in self.audio_projector.parameters():
+                param.requires_grad = False
+        else:
+            # Audio projector is trainable (Stage 1)
+            self.audio_projector.train()
+            for param in self.audio_projector.parameters():
+                param.requires_grad = True
 
     def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """Get list of trainable parameters (only projector in Stage-1)."""
-        return [p for p in self.audio_projector.parameters() if p.requires_grad]
+        """Get list of all trainable parameters based on training stage."""
+        return [p for p in self.parameters() if p.requires_grad]
 
     def print_trainable_parameters(self):
         """Print trainable parameter statistics."""
         trainable_params = 0
         all_params = 0
+
+        print(f"\nTraining Stage: {self.config.training_stage}")
+        if self.config.training_stage == 1:
+            print("Stage 1: Training projection layer only")
+        elif self.config.training_stage == 2:
+            print("Stage 2: Training LLM only")
 
         print("\nTrainable parameters:")
         for name, param in self.named_parameters():

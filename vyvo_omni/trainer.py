@@ -21,7 +21,9 @@ class VyvoOmniTrainer:
     Trainer for VyvoOmni model with multi-GPU support.
 
     Uses HuggingFace Accelerate for distributed training.
-    Only the audio projector is wrapped in DDP since Whisper and LLM are frozen.
+
+    Stage 1: Only the audio projector is wrapped in DDP (Whisper and LLM are frozen).
+    Stage 2: Only the LLM is wrapped in DDP (Whisper and projector are frozen).
     """
 
     def __init__(
@@ -70,14 +72,37 @@ class VyvoOmniTrainer:
         self.train_dataloader = self._create_dataloader(train_dataset, is_train=True)
         self.eval_dataloader = self._create_dataloader(eval_dataset, is_train=False) if eval_dataset else None
 
+        # Store training stage
+        self.training_stage = model.config.training_stage
+
         # Move frozen components to device (NOT wrapped in DDP)
         self.device = self.accelerator.device
         self.model.whisper_encoder.to(self.device)
-        self.model.llm.to(self.device)
 
-        # Set up optimizer for projector only
+        # Move appropriate components based on training stage
+        if self.training_stage == 1:
+            # Stage 1: LLM is frozen, move to device without DDP
+            self.model.llm.to(self.device)
+            # Projector will be wrapped in DDP later
+        elif self.training_stage == 2:
+            # Stage 2: Projector is frozen, move to device without DDP
+            # Cast projector to same dtype as LLM to avoid dtype mismatches
+            llm_dtype = self.model.llm.dtype if hasattr(self.model.llm, 'dtype') else torch.bfloat16
+            self.model.audio_projector.to(device=self.device, dtype=llm_dtype)
+            # LLM will be wrapped in DDP later
+
+        # Set up optimizer based on training stage
+        if self.training_stage == 1:
+            # Stage 1: Train projector only
+            trainable_params = self.model.audio_projector.parameters()
+        elif self.training_stage == 2:
+            # Stage 2: Train LLM only
+            trainable_params = self.model.llm.parameters()
+        else:
+            raise ValueError(f"Invalid training stage: {self.training_stage}. Must be 1 or 2.")
+
         self.optimizer = AdamW(
-            self.model.audio_projector.parameters(),
+            trainable_params,
             lr=training_config.learning_rate,
             weight_decay=training_config.weight_decay,
         )
@@ -97,14 +122,31 @@ class VyvoOmniTrainer:
 
         # Set up gradient checkpointing if enabled
         if training_config.gradient_checkpointing:
-            if hasattr(self.model.llm, "gradient_checkpointing_enable"):
+            if self.training_stage == 2 and hasattr(self.model.llm, "gradient_checkpointing_enable"):
+                # Only enable gradient checkpointing for LLM in stage 2
                 self.model.llm.gradient_checkpointing_enable()
 
-        # Prepare ONLY the projector, optimizer, dataloader, scheduler with Accelerate
-        # This wraps only the trainable projector in DDP
-        self.model.audio_projector, self.optimizer, self.train_dataloader, self.scheduler = self.accelerator.prepare(
-            self.model.audio_projector, self.optimizer, self.train_dataloader, self.scheduler
-        )
+        # Prepare trainable components with Accelerate (wraps in DDP)
+        if self.training_stage == 1:
+            # Stage 1: Wrap projector in DDP
+            self.model.audio_projector, self.optimizer, self.train_dataloader, self.scheduler = self.accelerator.prepare(
+                self.model.audio_projector, self.optimizer, self.train_dataloader, self.scheduler
+            )
+        elif self.training_stage == 2:
+            # Stage 2: Wrap LLM in DDP
+            # IMPORTANT: Ensure LLM parameters require grad BEFORE wrapping
+            for param in self.model.llm.parameters():
+                param.requires_grad = True
+
+            self.model.llm, self.optimizer, self.train_dataloader, self.scheduler = self.accelerator.prepare(
+                self.model.llm, self.optimizer, self.train_dataloader, self.scheduler
+            )
+
+            # Verify after DDP wrapping
+            unwrapped_llm = self.accelerator.unwrap_model(self.model.llm)
+            for param in unwrapped_llm.parameters():
+                if not param.requires_grad:
+                    param.requires_grad = True
 
         if self.eval_dataloader is not None:
             self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
@@ -179,8 +221,11 @@ class VyvoOmniTrainer:
         """
         Custom forward pass that handles frozen and trainable components separately.
 
+        Stage 1: Gradients flow through projector only
+        Stage 2: Gradients flow through LLM only
+
         Returns:
-            loss: Scalar loss tensor with gradients only through projector
+            loss: Scalar loss tensor with gradients through trainable component
         """
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
@@ -189,21 +234,46 @@ class VyvoOmniTrainer:
         labels = batch["labels"]
 
         batch_size = input_ids.shape[0]
-        dtype = self.model.llm.dtype
 
-        # Step 1: Encode audio with frozen Whisper (no gradients)
-        # Cast audio features to model dtype (bfloat16)
+        # Get LLM dtype - handle both wrapped and unwrapped models
+        if self.training_stage == 2:
+            # LLM is wrapped in DDP
+            unwrapped_llm = self.accelerator.unwrap_model(self.model.llm)
+            dtype = unwrapped_llm.dtype if hasattr(unwrapped_llm, 'dtype') else torch.bfloat16
+        else:
+            dtype = self.model.llm.dtype if hasattr(self.model.llm, 'dtype') else torch.bfloat16
+
+        # Step 1: Encode audio with frozen Whisper (always no gradients)
         audio_features = audio_features.to(dtype=dtype)
         with torch.no_grad():
             audio_hidden = self.model.whisper_encoder(audio_features).last_hidden_state
 
-        # Step 2: Project audio to LLM space (TRAINABLE - gradients flow here)
-        audio_embeds = self.model.audio_projector(audio_hidden)
+        # Step 2: Project audio to LLM space
+        if self.training_stage == 1:
+            # Stage 1: Projector is trainable - allow gradients
+            audio_embeds = self.model.audio_projector(audio_hidden)
+        elif self.training_stage == 2:
+            # Stage 2: Projector is frozen - no gradients
+            # Projector is already cast to LLM dtype when moved to device
+            with torch.no_grad():
+                audio_embeds = self.model.audio_projector(audio_hidden)
+                # Ensure output is in correct dtype
+                audio_embeds = audio_embeds.to(dtype=dtype)
+
         audio_seq_len = audio_embeds.shape[1]
 
-        # Step 3: Get text embeddings (no gradients through LLM embeddings)
-        with torch.no_grad():
-            text_embeds = self.model.llm.get_input_embeddings()(input_ids)
+        # Step 3: Get text embeddings
+        if self.training_stage == 1:
+            # Stage 1: LLM embeddings are frozen - no gradients
+            with torch.no_grad():
+                text_embeds = self.model.llm.get_input_embeddings()(input_ids)
+        elif self.training_stage == 2:
+            # Stage 2: LLM is trainable - allow gradients
+            # Access embedding layer through unwrapped model
+            unwrapped_llm = self.accelerator.unwrap_model(self.model.llm)
+            text_embeds = unwrapped_llm.get_input_embeddings()(input_ids)
+            # Explicitly detach audio embeddings to avoid gradient issues
+            audio_embeds = audio_embeds.detach()
 
         # Step 4: Merge audio and text embeddings
         merged_embeds_list = []
@@ -216,7 +286,8 @@ class VyvoOmniTrainer:
             pre_audio = text_embeds[i, :start_pos + 1]
             post_audio = text_embeds[i, end_pos:]
 
-            # Merge embeddings - audio_embeds has gradients
+            # Merge embeddings
+            # In Stage 2: text parts have gradients, audio part is detached
             merged = torch.cat([pre_audio, audio_embeds[i], post_audio], dim=0)
             merged_embeds_list.append(merged)
 
@@ -240,27 +311,58 @@ class VyvoOmniTrainer:
         # Pad to same length
         max_len = max(e.shape[0] for e in merged_embeds_list)
 
-        padded_embeds = torch.zeros(
-            batch_size, max_len, self.model.llm_hidden_size,
-            device=self.device, dtype=dtype
-        )
-        padded_attention = torch.zeros(
-            batch_size, max_len,
-            device=self.device, dtype=attention_mask.dtype
-        )
-        padded_labels = torch.full(
-            (batch_size, max_len), -100,
-            device=self.device, dtype=torch.long
-        ) if labels is not None else None
+        # Create padded tensors - use list comprehension to preserve gradients
+        padded_embeds_list = []
+        padded_attention_list = []
+        padded_labels_list = [] if labels is not None else None
 
         for i in range(batch_size):
             seq_len = merged_embeds_list[i].shape[0]
-            padded_embeds[i, :seq_len] = merged_embeds_list[i]
-            padded_attention[i, :seq_len] = merged_attention_list[i]
-            if padded_labels is not None:
-                padded_labels[i, :seq_len] = merged_labels_list[i]
+            pad_len = max_len - seq_len
 
-        # Step 5: Forward through LLM (frozen, but gradients flow through embeddings)
+            # Pad embeddings (preserve gradients)
+            if pad_len > 0:
+                pad_tensor = torch.zeros(
+                    pad_len, self.model.llm_hidden_size,
+                    device=self.device, dtype=dtype
+                )
+                padded_embed = torch.cat([merged_embeds_list[i], pad_tensor], dim=0)
+            else:
+                padded_embed = merged_embeds_list[i]
+            padded_embeds_list.append(padded_embed)
+
+            # Pad attention mask
+            if pad_len > 0:
+                pad_attn = torch.zeros(pad_len, device=self.device, dtype=attention_mask.dtype)
+                padded_attn = torch.cat([merged_attention_list[i], pad_attn], dim=0)
+            else:
+                padded_attn = merged_attention_list[i]
+            padded_attention_list.append(padded_attn)
+
+            # Pad labels
+            if padded_labels_list is not None:
+                if pad_len > 0:
+                    pad_labels = torch.full((pad_len,), -100, device=self.device, dtype=torch.long)
+                    padded_label = torch.cat([merged_labels_list[i], pad_labels], dim=0)
+                else:
+                    padded_label = merged_labels_list[i]
+                padded_labels_list.append(padded_label)
+
+        # Stack into batch tensors (preserves gradients)
+        padded_embeds = torch.stack(padded_embeds_list, dim=0)
+        padded_attention = torch.stack(padded_attention_list, dim=0)
+        padded_labels = torch.stack(padded_labels_list, dim=0) if padded_labels_list is not None else None
+
+        # In Stage 2, ensure padded_embeds requires grad
+        if self.training_stage == 2:
+            # Verify gradients are enabled
+            if not padded_embeds.requires_grad:
+                # This shouldn't happen, but just in case
+                padded_embeds.requires_grad_(True)
+
+        # Step 5: Forward through LLM
+        # Stage 1: LLM is frozen, gradients only through projector
+        # Stage 2: LLM is trainable, gradients through LLM parameters and embeddings
         outputs = self.model.llm(
             inputs_embeds=padded_embeds,
             attention_mask=padded_attention,
@@ -276,7 +378,12 @@ class VyvoOmniTrainer:
         if self.eval_dataloader is None:
             return {}
 
-        self.model.audio_projector.eval()
+        # Set trainable component to eval mode
+        if self.training_stage == 1:
+            self.model.audio_projector.eval()
+        elif self.training_stage == 2:
+            self.model.llm.eval()
+
         total_loss = 0.0
         num_batches = 0
 
@@ -293,7 +400,12 @@ class VyvoOmniTrainer:
         avg_loss = total_loss / max(num_batches, 1)
         metrics = {"eval_loss": avg_loss}
 
-        self.model.audio_projector.train()
+        # Set trainable component back to train mode
+        if self.training_stage == 1:
+            self.model.audio_projector.train()
+        elif self.training_stage == 2:
+            self.model.llm.train()
+
         return metrics
 
     def _log(self, metrics: Dict[str, Any]):
@@ -341,12 +453,17 @@ class VyvoOmniTrainer:
         )
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # Unwrap projector for saving
-        unwrapped_projector = self.accelerator.unwrap_model(self.model.audio_projector)
-
-        # Save projector
-        projector_path = os.path.join(checkpoint_dir, "audio_projector.pt")
-        torch.save(unwrapped_projector.state_dict(), projector_path)
+        # Unwrap and save trainable component based on training stage
+        if self.training_stage == 1:
+            # Stage 1: Save projector
+            unwrapped_component = self.accelerator.unwrap_model(self.model.audio_projector)
+            component_path = os.path.join(checkpoint_dir, "audio_projector.pt")
+            torch.save(unwrapped_component.state_dict(), component_path)
+        elif self.training_stage == 2:
+            # Stage 2: Save LLM
+            unwrapped_component = self.accelerator.unwrap_model(self.model.llm)
+            component_path = os.path.join(checkpoint_dir, "llm_model")
+            unwrapped_component.save_pretrained(component_path)
 
         # Save config
         config_path = os.path.join(checkpoint_dir, "vyvo_config.json")
@@ -361,6 +478,7 @@ class VyvoOmniTrainer:
             "global_step": self.global_step,
             "epoch": self.current_epoch,
             "best_eval_loss": self.best_eval_loss,
+            "training_stage": self.training_stage,
         }
         torch.save(
             training_state,
@@ -380,7 +498,12 @@ class VyvoOmniTrainer:
         if is_best:
             best_dir = os.path.join(self.config.output_dir, "best_model")
             os.makedirs(best_dir, exist_ok=True)
-            torch.save(unwrapped_projector.state_dict(), os.path.join(best_dir, "audio_projector.pt"))
+
+            if self.training_stage == 1:
+                torch.save(unwrapped_component.state_dict(), os.path.join(best_dir, "audio_projector.pt"))
+            elif self.training_stage == 2:
+                unwrapped_component.save_pretrained(os.path.join(best_dir, "llm_model"))
+
             with open(os.path.join(best_dir, "vyvo_config.json"), "w") as f:
                 json.dump(self.model.config.__dict__, f, indent=2)
             self.model.tokenizer.save_pretrained(best_dir)
@@ -410,7 +533,10 @@ class VyvoOmniTrainer:
         """Run the full training loop."""
         if self.accelerator.is_main_process:
             print("=" * 60)
-            print("VyvoOmni Stage-1 Training")
+            if self.training_stage == 1:
+                print("VyvoOmni Stage-1 Training: Audio Projector")
+            elif self.training_stage == 2:
+                print("VyvoOmni Stage-2 Training: LLM Fine-tuning")
             print("=" * 60)
             print(f"Number of GPUs: {self.accelerator.num_processes}")
             print(f"Total training steps: {self.total_steps}")
@@ -421,11 +547,42 @@ class VyvoOmniTrainer:
             print(f"Learning rate: {self.config.learning_rate}")
             print(f"Mixed precision: {self.accelerator.mixed_precision}")
             print("=" * 60)
-            print("\nTrainable: audio_projector ONLY")
-            print(f"Projector params: {sum(p.numel() for p in self.model.audio_projector.parameters()):,}")
+
+            if self.training_stage == 1:
+                print("\nTrainable: audio_projector ONLY")
+                print(f"Projector params: {sum(p.numel() for p in self.model.audio_projector.parameters()):,}")
+            elif self.training_stage == 2:
+                print("\nTrainable: LLM ONLY")
+                llm_params = sum(p.numel() for p in self.model.llm.parameters() if p.requires_grad)
+                print(f"LLM trainable params: {llm_params:,}")
+
             print("=" * 60)
 
-        self.model.audio_projector.train()
+        # Set trainable component to train mode
+        if self.training_stage == 1:
+            self.model.audio_projector.train()
+        elif self.training_stage == 2:
+            self.model.llm.train()
+
+            # Verify LLM parameters have gradients enabled
+            if self.accelerator.is_main_process:
+                # Unwrap LLM from DDP to access its methods
+                unwrapped_llm = self.accelerator.unwrap_model(self.model.llm)
+
+                llm_trainable = sum(p.numel() for p in unwrapped_llm.parameters() if p.requires_grad)
+                llm_total = sum(p.numel() for p in unwrapped_llm.parameters())
+                embed_requires_grad = unwrapped_llm.get_input_embeddings().weight.requires_grad
+
+                print(f"\nLLM gradient check:")
+                print(f"  Trainable params: {llm_trainable:,} / {llm_total:,}")
+                print(f"  Embedding layer requires_grad: {embed_requires_grad}")
+
+                if llm_trainable == 0:
+                    raise RuntimeError(
+                        "ERROR: LLM has no trainable parameters! "
+                        "Check that training_stage=2 is set correctly in the model config."
+                    )
+
         accumulation_loss = 0.0
 
         for epoch in range(self.config.num_train_epochs):
@@ -441,15 +598,25 @@ class VyvoOmniTrainer:
                 )
 
             for step, batch in enumerate(train_dataloader):
-                with self.accelerator.accumulate(self.model.audio_projector):
+                # Accumulate gradients for the trainable component
+                trainable_component = self.model.audio_projector if self.training_stage == 1 else self.model.llm
+
+                with self.accelerator.accumulate(trainable_component):
                     loss = self._forward_pass(batch)
                     self.accelerator.backward(loss)
 
                     if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(
-                            self.model.audio_projector.parameters(),
-                            self.config.max_grad_norm,
-                        )
+                        # Clip gradients for trainable parameters
+                        if self.training_stage == 1:
+                            self.accelerator.clip_grad_norm_(
+                                self.model.audio_projector.parameters(),
+                                self.config.max_grad_norm,
+                            )
+                        elif self.training_stage == 2:
+                            self.accelerator.clip_grad_norm_(
+                                self.model.llm.parameters(),
+                                self.config.max_grad_norm,
+                            )
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -527,13 +694,23 @@ class VyvoOmniTrainer:
         if os.path.exists(accelerator_state_dir):
             self.accelerator.load_state(accelerator_state_dir)
 
-        projector_path = os.path.join(checkpoint_dir, "audio_projector.pt")
-        if os.path.exists(projector_path):
-            unwrapped_projector = self.accelerator.unwrap_model(self.model.audio_projector)
-            unwrapped_projector.load_state_dict(
-                torch.load(projector_path, weights_only=True, map_location="cpu")
-            )
+        # Load the appropriate component based on training stage
+        if self.training_stage == 1:
+            projector_path = os.path.join(checkpoint_dir, "audio_projector.pt")
+            if os.path.exists(projector_path):
+                unwrapped_projector = self.accelerator.unwrap_model(self.model.audio_projector)
+                unwrapped_projector.load_state_dict(
+                    torch.load(projector_path, weights_only=True, map_location="cpu")
+                )
+        elif self.training_stage == 2:
+            llm_path = os.path.join(checkpoint_dir, "llm_model")
+            if os.path.exists(llm_path):
+                from transformers import AutoModelForCausalLM
+                unwrapped_llm = self.accelerator.unwrap_model(self.model.llm)
+                loaded_llm = AutoModelForCausalLM.from_pretrained(llm_path)
+                unwrapped_llm.load_state_dict(loaded_llm.state_dict())
 
         if self.accelerator.is_main_process:
             print(f"Resumed from checkpoint: {checkpoint_dir}")
+            print(f"Training Stage: {self.training_stage}")
             print(f"Global step: {self.global_step}, Epoch: {self.current_epoch}")
