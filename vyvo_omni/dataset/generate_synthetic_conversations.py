@@ -22,8 +22,8 @@ from typing import List, Dict
 # ============================================================================
 
 # Input/Output
-INPUT_JSON = "../../data/train.json"  # Your transcription JSON
-OUTPUT_JSON = "../../data/train_conversational.json"  # Output conversational JSON
+INPUT_JSON = "data/train.json"  # Your transcription JSON
+OUTPUT_JSON = "data/train_conversational.json"  # Output conversational JSON
 
 # LLM API Settings
 LLM_PROVIDER = "deepseek"  # Options: "deepseek", "anthropic", "openai"
@@ -179,11 +179,16 @@ def create_instruction_sample(audio_path: str, transcription: str,
 def process_transcriptions():
     """Main processing function."""
 
-    print(f"Generating synthetic data: {INPUT_JSON} → {OUTPUT_JSON}")
+    # Get absolute paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    input_json_abs = os.path.abspath(os.path.join(script_dir, INPUT_JSON))
+    output_json_abs = os.path.abspath(os.path.join(script_dir, OUTPUT_JSON))
+
+    print(f"Generating synthetic data: {input_json_abs} → {output_json_abs}")
     print(f"LLM: {LLM_PROVIDER}")
 
     # Load input data
-    with open(INPUT_JSON, "r") as f:
+    with open(input_json_abs, "r") as f:
         data = json.load(f)
 
     samples = data["samples"]
@@ -200,7 +205,7 @@ def process_transcriptions():
 
     for i, sample in enumerate(tqdm(samples, desc="Processing")):
         audio_path = sample["audio_path"]
-        transcription = sample["text"]
+        transcription = sample.get("response") or sample.get("text", "")
 
         # Always include original transcription task
         conversational_samples.append(
@@ -229,7 +234,7 @@ def process_transcriptions():
 
         # Save progress every BATCH_SIZE samples
         if (i + 1) % BATCH_SIZE == 0:
-            temp_output = OUTPUT_JSON.replace(".json", f"_temp_{i+1}.json")
+            temp_output = output_json_abs.replace(".json", f"_temp_{i+1}.json")
             with open(temp_output, "w") as f:
                 json.dump({"samples": conversational_samples}, f, indent=2)
 
@@ -237,22 +242,23 @@ def process_transcriptions():
     output_data = {
         "samples": conversational_samples,
         "metadata": {
-            "source": INPUT_JSON,
+            "source": input_json_abs,
             "total_samples": len(conversational_samples),
             "original_transcriptions": len(samples),
             "avg_pairs_per_audio": len(conversational_samples) / len(samples),
         }
     }
 
-    with open(OUTPUT_JSON, "w") as f:
+    with open(output_json_abs, "w") as f:
         json.dump(output_data, f, indent=2)
 
     # Clean up temp files
-    for temp_file in os.listdir(os.path.dirname(OUTPUT_JSON) or "."):
+    output_dir = os.path.dirname(output_json_abs)
+    for temp_file in os.listdir(output_dir):
         if temp_file.startswith("train_conversational_temp_"):
-            os.remove(os.path.join(os.path.dirname(OUTPUT_JSON) or ".", temp_file))
+            os.remove(os.path.join(output_dir, temp_file))
 
-    print(f"Done: {len(conversational_samples)} samples → {OUTPUT_JSON}")
+    print(f"Done: {len(conversational_samples)} samples → {output_json_abs}")
 
 
 if __name__ == "__main__":
