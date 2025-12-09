@@ -13,9 +13,12 @@ class SpeechTextDataset(Dataset):
     """
     Dataset for speech-to-text training.
 
-    Expects data in one of two formats:
-    1. JSON file with list of {"audio_path": str, "text": str, "prompt": str (optional)}
-    2. Directory with audio files and corresponding .txt files
+    Expects data in one of three formats:
+    1. OmniAudio format (recommended):
+       JSON: {"samples": [{"audio_path": str, "task_token": str, "instruction": str, "response": str}, ...]}
+    2. Legacy format with system prompt:
+       JSON: {"system_prompt": str, "samples": [{"audio_path": str, "text": str}, ...]}
+    3. Directory with audio files and corresponding .txt files
 
     Args:
         data_path: Path to JSON file or directory containing audio files
@@ -26,6 +29,7 @@ class SpeechTextDataset(Dataset):
         audio_start_token: Token marking start of audio
         audio_end_token: Token marking end of audio
         max_text_length: Maximum text length in tokens
+        system_prompt: Default system prompt for legacy format (default: "Transcribe the following audio:")
     """
 
     def __init__(
@@ -134,13 +138,18 @@ class SpeechTextDataset(Dataset):
 
         # Support both old (transcription) and new (conversational) formats
         if "instruction" in sample and "response" in sample:
-            # New conversational format with task tokens
+            # New conversational format with task tokens (OmniAudio format)
             task_token = sample.get("task_token", "")
             instruction = sample["instruction"]
             response = sample["response"]
 
             # Format: <task_token> <instruction> <audio_start> [AUDIO] <audio_end> <response>
-            input_text = f"{task_token} {instruction}\n{self.audio_start_token}{self.audio_end_token}\n"
+            # Handle empty instruction gracefully (no extra space)
+            if instruction.strip():
+                input_text = f"{task_token} {instruction}\n{self.audio_start_token}{self.audio_end_token}\n"
+            else:
+                # For transcription task with no instruction
+                input_text = f"{task_token}\n{self.audio_start_token}{self.audio_end_token}\n"
             target_text = response
         else:
             # Old transcription format (backward compatible)

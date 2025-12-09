@@ -35,7 +35,13 @@ class VyvoOmniConfig:
     audio_start_token: str = "<|audio_start|>"
     audio_end_token: str = "<|audio_end|>"
 
-    # Task-specific tokens (like OmniAudio)
+    # Task-specific tokens (following OmniAudio methodology)
+    # These tokens distinguish between different audio-language tasks:
+    # - <|transcribe|>: For audio transcription (used in pretraining)
+    # - <|summarize|>: For audio summarization
+    # - <|question|>: For question answering about audio
+    # - <|describe|>: For audio description
+    # - <|chat|>: For conversational responses about audio
     transcribe_token: str = "<|transcribe|>"
     summarize_token: str = "<|summarize|>"
     question_token: str = "<|question|>"
