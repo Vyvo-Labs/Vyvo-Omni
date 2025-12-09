@@ -28,12 +28,21 @@ from vyvo_omni.config import VyvoOmniTrainingConfig
 # CONFIGURATION - Edit these variables
 # ============================================================================
 
+# Training Stage
+# Stage 1: Train projection layer only (freeze Whisper + LLM)
+# Stage 2: Train LLM only (freeze Whisper + projection)
+TRAINING_STAGE = 2  # Set to 1 or 2
+
 # Model
-LLM_MODEL = "Qwen/Qwen3-0.6B"
+LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 WHISPER_MODEL = "openai/whisper-large-v3"
 USE_FLASH_ATTENTION = True
 PROJECTION_LAYERS = 2
 PROJECTION_DROPOUT = 0.1
+
+# Stage 1 checkpoint to load for Stage 2 training
+# Set this to the path of your Stage 1 trained projector when starting Stage 2
+STAGE1_CHECKPOINT = None  # e.g., "./vyvo_omni_output/best_model/audio_projector.pt"
 
 # Data
 DATA_PATH = "./data/train.json"
@@ -42,12 +51,17 @@ MAX_AUDIO_LENGTH = 30.0
 MAX_SEQ_LENGTH = 2048
 
 # Training
-OUTPUT_DIR = "./vyvo_omni_output"
+# Output directory will be stage-specific by default
+OUTPUT_DIR = f"./vyvo_omni_output_stage{TRAINING_STAGE}" if TRAINING_STAGE in [1, 2] else "./vyvo_omni_output"
 NUM_EPOCHS = 3
-BATCH_SIZE = 8  # Per GPU batch size
-EVAL_BATCH_SIZE = 8
+BATCH_SIZE = 4  # Per GPU batch size
+EVAL_BATCH_SIZE = 4
 GRADIENT_ACCUMULATION_STEPS = 2
-LEARNING_RATE = 2e-5
+
+# Learning rate recommendations:
+# Stage 1 (projection layer): 1e-4 to 2e-4
+# Stage 2 (LLM fine-tuning): 5e-6 to 2e-5 (lower than Stage 1)
+LEARNING_RATE = 2e-5 if TRAINING_STAGE == 1 else 1e-5
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
 MAX_GRAD_NORM = 1.0
@@ -66,7 +80,7 @@ SAVE_TOTAL_LIMIT = 3
 # Logging
 REPORT_TO = "wandb"  # "wandb", "tensorboard", or "none"
 WANDB_PROJECT = "vyvo-omni"
-WANDB_RUN_NAME = None  # Auto-generated if None
+WANDB_RUN_NAME = f"stage{TRAINING_STAGE}" if TRAINING_STAGE in [1, 2] else None  # Auto-generated if None
 WANDB_ENTITY = "narkadir-ai"  # Your wandb username or team name
 
 # Misc
@@ -99,12 +113,15 @@ def main():
         projection_num_layers=PROJECTION_LAYERS,
         projection_dropout=PROJECTION_DROPOUT,
         max_audio_length=MAX_AUDIO_LENGTH,
-        freeze_whisper=True,
-        freeze_llm=True,
-        train_projection_only=True,
+        training_stage=TRAINING_STAGE,
     )
 
     if is_main_process:
+        print(f"Training Stage: {TRAINING_STAGE}")
+        if TRAINING_STAGE == 1:
+            print("Stage 1: Training projection layer only")
+        elif TRAINING_STAGE == 2:
+            print("Stage 2: Training LLM only")
         print(f"LLM: {LLM_MODEL}")
         print(f"Whisper: {WHISPER_MODEL}")
         print(f"Batch size: {BATCH_SIZE}")
@@ -113,6 +130,54 @@ def main():
 
     # Create model
     model = VyvoOmniModel(model_config)
+
+    # For Stage 2: Explicitly unfreeze LLM parameters
+    if TRAINING_STAGE == 2:
+        if is_main_process:
+            print("\nUnfreezing LLM parameters for Stage 2 training...")
+
+        # Ensure all LLM parameters are trainable
+        for param in model.llm.parameters():
+            param.requires_grad = True
+
+        # Ensure projection layer is frozen
+        for param in model.audio_projector.parameters():
+            param.requires_grad = False
+
+        if is_main_process:
+            llm_trainable = sum(p.numel() for p in model.llm.parameters() if p.requires_grad)
+            proj_trainable = sum(p.numel() for p in model.audio_projector.parameters() if p.requires_grad)
+            print(f"✓ LLM trainable params: {llm_trainable:,}")
+            print(f"✓ Projection trainable params: {proj_trainable:,} (should be 0)")
+
+    # For Stage 2: Load the trained projection layer from Stage 1
+    if TRAINING_STAGE == 2 and STAGE1_CHECKPOINT is not None:
+        if is_main_process:
+            print(f"\nLoading Stage 1 checkpoint from: {STAGE1_CHECKPOINT}")
+
+        if os.path.isdir(STAGE1_CHECKPOINT):
+            # Load from directory (checkpoint folder)
+            projector_path = os.path.join(STAGE1_CHECKPOINT, "audio_projector.pt")
+        else:
+            # Direct path to projector file
+            projector_path = STAGE1_CHECKPOINT
+
+        if os.path.exists(projector_path):
+            import torch
+            model.audio_projector.load_state_dict(
+                torch.load(projector_path, weights_only=True, map_location="cpu")
+            )
+            if is_main_process:
+                print("✓ Stage 1 projection layer loaded successfully")
+        else:
+            if is_main_process:
+                print(f"Warning: Stage 1 checkpoint not found at {projector_path}")
+                print("Starting Stage 2 with random projection layer initialization")
+    elif TRAINING_STAGE == 2 and STAGE1_CHECKPOINT is None:
+        if is_main_process:
+            print("\nWarning: STAGE1_CHECKPOINT is None")
+            print("For Stage 2 training, you should load the trained projection layer from Stage 1")
+            print("Set STAGE1_CHECKPOINT to the path of your Stage 1 checkpoint")
 
     # Training config
     training_config = VyvoOmniTrainingConfig(

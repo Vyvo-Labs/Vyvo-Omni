@@ -19,9 +19,13 @@ class VyvoOmniConfig:
     projection_dropout: float = 0.1
 
     # Training configuration
+    # Stage 1: Train projection layer only (freeze Whisper + LLM)
+    # Stage 2: Train LLM only (freeze Whisper + projection)
+    training_stage: int = 1  # 1 or 2
     freeze_whisper: bool = True
     freeze_llm: bool = True
-    train_projection_only: bool = True
+    freeze_projection: bool = False
+    train_projection_only: bool = True  # Deprecated, use training_stage instead
 
     # Audio configuration
     audio_sample_rate: int = 16000
@@ -31,10 +35,31 @@ class VyvoOmniConfig:
     audio_start_token: str = "<|audio_start|>"
     audio_end_token: str = "<|audio_end|>"
 
+    # Task-specific tokens (like OmniAudio)
+    transcribe_token: str = "<|transcribe|>"
+    summarize_token: str = "<|summarize|>"
+    question_token: str = "<|question|>"
+    describe_token: str = "<|describe|>"
+    chat_token: str = "<|chat|>"
+
     def __post_init__(self):
+        # Handle training stage configuration
+        if self.training_stage == 1:
+            # Stage 1: Train projection only
+            self.freeze_whisper = True
+            self.freeze_llm = True
+            self.freeze_projection = False
+        elif self.training_stage == 2:
+            # Stage 2: Train LLM only
+            self.freeze_whisper = True
+            self.freeze_llm = False
+            self.freeze_projection = True
+
+        # Legacy support
         if self.train_projection_only:
             self.freeze_whisper = True
             self.freeze_llm = True
+            self.freeze_projection = False
 
 
 @dataclass

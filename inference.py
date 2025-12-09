@@ -3,11 +3,11 @@
 Inference script for VyvoOmni model.
 
 Usage:
-    python inference.py --model_path ./vyvo_omni_output/best_model --audio_path audio.wav
-    python inference.py --model_path ./vyvo_omni_output/best_model --audio_path audio.wav --prompt "Transcribe:"
+    python inference.py
+
+Edit the manual configuration section in main() to set your model path and audio file.
 """
 
-import argparse
 import torch
 import torchaudio
 from typing import Optional
@@ -66,7 +66,9 @@ def transcribe(
         sampling_rate=model.config.audio_sample_rate,
         return_tensors="pt",
     )
-    audio_features = audio_features.input_features.to(device)
+    # Match model's dtype (e.g., bfloat16, float32)
+    model_dtype = next(model.parameters()).dtype
+    audio_features = audio_features.input_features.to(device=device, dtype=model_dtype)
 
     # Create input text with audio placeholder
     prompt = prompt or "Transcribe the following audio:"
@@ -114,71 +116,39 @@ def transcribe(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="VyvoOmni Inference")
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        required=True,
-        help="Path to trained model directory",
-    )
-    parser.add_argument(
-        "--audio_path",
-        type=str,
-        required=True,
-        help="Path to audio file to transcribe",
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default="Transcribe the following audio:",
-        help="Prompt to use for transcription",
-    )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=256,
-        help="Maximum new tokens to generate",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.7,
-        help="Sampling temperature",
-    )
-    parser.add_argument(
-        "--top_p",
-        type=float,
-        default=0.9,
-        help="Top-p sampling parameter",
-    )
-    parser.add_argument(
-        "--no_sample",
-        action="store_true",
-        help="Disable sampling (use greedy decoding)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use",
-    )
+    # Manual configuration
+    model_path = "vyvo_omni_output_stage2/checkpoint-500"
+    audio_path = "test.wav"  # Change this to your audio file
+    prompt = "Transcribe the following audio:"  # Optional prompt in Turkish
+    max_new_tokens = 512
+    temperature = 0.9
+    top_p = 0.9
+    do_sample = True
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    args = parser.parse_args()
+    print(f"Loading model from {model_path}...")
+    model = VyvoOmniModel.from_pretrained(model_path)
 
-    print(f"Loading model from {args.model_path}...")
-    model = VyvoOmniModel.from_pretrained(args.model_path)
-    model.to(args.device)
+    # Ensure all model components have the same dtype
+    # Get dtype from whisper encoder (which is loaded in bfloat16)
+    whisper_dtype = next(model.whisper_encoder.parameters()).dtype
+    print(f"Converting model to {whisper_dtype}...")
+
+    # Convert audio projector to match whisper dtype
+    model.audio_projector = model.audio_projector.to(whisper_dtype)
+
+    model.to(device)
     model.eval()
 
-    print(f"Transcribing {args.audio_path}...")
+    print(f"Transcribing {audio_path}...")
     transcription = transcribe(
         model=model,
-        audio_path=args.audio_path,
-        prompt=args.prompt,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        do_sample=not args.no_sample,
+        audio_path=audio_path,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        do_sample=do_sample,
     )
 
     print("\n" + "=" * 50)
