@@ -4,24 +4,12 @@ Dataset preparation and download utilities for VyvoOmni training.
 
 ## Scripts
 
-### 1. Download MLS Dataset (Two-Step Process)
+### 1. Download MLS Dataset
 
-**Step 1 - Fast snapshot download:**
-```bash
-python download_snapshot.py
-```
-- Uses `hf_transfer` for maximum speed
-- 16 parallel workers
-- Downloads to HuggingFace cache
-- **Requires:** `pip install hf-transfer`
-
-**Step 2 - Extract and process:**
 ```bash
 python download_mls_dataset.py
 ```
-- Extracts files from cache
-- Converts to 16kHz WAV files
-- Saves to local `data/` directory
+Downloads and processes the complete dataset.
 
 **Downloads:**
 - Audio: `parler-tts/mls_eng_10k` → `data/audio/`
@@ -76,16 +64,13 @@ python generate_synthetic_conversations.py
 ```bash
 cd vyvo_omni/dataset
 
-# Step 1: Fast download to cache (FAST - parallel)
-python download_snapshot.py
-
-# Step 2: Extract files
+# Download dataset
 python download_mls_dataset.py
 
-# Step 3: Generate conversational data (optional)
+# Generate conversational data (optional)
 python generate_synthetic_conversations.py
 
-# Step 4: Train model
+# Train model
 cd ../..
 python train.py
 ```
@@ -95,4 +80,3 @@ python train.py
 - All JSONs use relative paths (`audio/audio_*.wav`)
 - Works across different servers/directories
 - No path fixing needed
-- Use `download_snapshot.py` for fastest downloads
