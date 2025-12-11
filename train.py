@@ -45,7 +45,7 @@ PROJECTION_DROPOUT = 0.1
 STAGE1_CHECKPOINT = None  # e.g., "./vyvo_omni_output/best_model/audio_projector.pt"
 
 # Data
-DATA_PATH = "./data/train.json"
+DATA_PATH = "./data/train_conversational.json"  # Updated to use conversational data
 EVAL_DATA_PATH = "./data/train_eval.json"
 MAX_AUDIO_LENGTH = 30.0
 MAX_SEQ_LENGTH = 2048

@@ -1,29 +1,22 @@
-#!/usr/bin/env python3
-"""
-Generate synthetic conversational data from transcriptions using LLM.
-
-This script transforms pure transcription data into instruction-response pairs,
-similar to OmniAudio's SFT stage.
-
-Usage:
-    1. Set your API key in environment: export DEEPSEEK_API_KEY=your-key
-    2. Edit configuration below
-    3. Run: python generate_synthetic_conversations.py
-"""
-
 import os
 import json
 import random
 from tqdm import tqdm
 from typing import List, Dict
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
 # Input/Output
-INPUT_JSON = "data/train.json"  # Your transcription JSON
-OUTPUT_JSON = "data/train_conversational.json"  # Output conversational JSON
+INPUT_JSON = "../../data/train.json"  # Your transcription JSON
+OUTPUT_JSON = "../../data/train_conversational.json"  # Output conversational JSON
 
 # LLM API Settings
 LLM_PROVIDER = "deepseek"  # Options: "deepseek", "anthropic", "openai"
@@ -32,9 +25,10 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 # Generation settings
-MAX_SAMPLES = None  # Limit samples to process (None = all)
+MAX_SAMPLES = 1000  # Limit samples to process (None = all)
 QA_PAIRS_PER_TRANSCRIPTION = 3  # Number of Q&A pairs per transcription
 BATCH_SIZE = 10  # Process in batches to save progress
+MAX_WORKERS = 20  # Number of parallel workers for API calls
 
 # Task distribution (should sum to 1.0)
 TASK_DISTRIBUTION = {
@@ -176,8 +170,43 @@ def create_instruction_sample(audio_path: str, transcription: str,
     }
 
 
+def process_single_sample(sample, client):
+    """Process a single sample and return conversational samples."""
+    audio_path = sample["audio_path"]
+    transcription = sample.get("response") or sample.get("text", "")
+
+    result_samples = []
+
+    # Always include original transcription task
+    result_samples.append(
+        create_instruction_sample(
+            audio_path=audio_path,
+            transcription=transcription,
+            task="transcribe",
+            question="Transcribe this audio.",
+            answer=transcription
+        )
+    )
+
+    # Generate synthetic Q&A pairs
+    qa_pairs = generate_qa_pairs(transcription, client, QA_PAIRS_PER_TRANSCRIPTION)
+
+    for qa in qa_pairs:
+        result_samples.append(
+            create_instruction_sample(
+                audio_path=audio_path,
+                transcription=transcription,
+                task=qa.get("task", "question"),
+                question=qa["question"],
+                answer=qa["answer"]
+            )
+        )
+
+    return result_samples
+
+
 def process_transcriptions():
-    """Main processing function."""
+    """Main processing function with parallel processing."""
 
     # Get absolute paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -186,6 +215,7 @@ def process_transcriptions():
 
     print(f"Generating synthetic data: {input_json_abs} → {output_json_abs}")
     print(f"LLM: {LLM_PROVIDER}")
+    print(f"Parallel workers: {MAX_WORKERS}")
 
     # Load input data
     with open(input_json_abs, "r") as f:
@@ -200,43 +230,40 @@ def process_transcriptions():
     # Initialize LLM client
     client = get_llm_client()
 
-    # Process samples
+    # Process samples in parallel
     conversational_samples = []
+    samples_lock = Lock()
+    processed_count = 0
 
-    for i, sample in enumerate(tqdm(samples, desc="Processing")):
-        audio_path = sample["audio_path"]
-        transcription = sample.get("response") or sample.get("text", "")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all tasks
+        future_to_sample = {
+            executor.submit(process_single_sample, sample, client): i
+            for i, sample in enumerate(samples)
+        }
 
-        # Always include original transcription task
-        conversational_samples.append(
-            create_instruction_sample(
-                audio_path=audio_path,
-                transcription=transcription,
-                task="transcribe",
-                question="Transcribe this audio.",
-                answer=transcription
-            )
-        )
+        # Process completed tasks with progress bar
+        with tqdm(total=len(samples), desc="Processing") as pbar:
+            for future in as_completed(future_to_sample):
+                try:
+                    result = future.result()
 
-        # Generate synthetic Q&A pairs
-        qa_pairs = generate_qa_pairs(transcription, client, QA_PAIRS_PER_TRANSCRIPTION)
+                    # Thread-safe append
+                    with samples_lock:
+                        conversational_samples.extend(result)
+                        processed_count += 1
 
-        for qa in qa_pairs:
-            conversational_samples.append(
-                create_instruction_sample(
-                    audio_path=audio_path,
-                    transcription=transcription,
-                    task=qa.get("task", "question"),
-                    question=qa["question"],
-                    answer=qa["answer"]
-                )
-            )
+                        # Save progress every BATCH_SIZE samples
+                        if processed_count % BATCH_SIZE == 0:
+                            temp_output = output_json_abs.replace(".json", f"_temp_{processed_count}.json")
+                            with open(temp_output, "w") as f:
+                                json.dump({"samples": conversational_samples}, f, indent=2)
 
-        # Save progress every BATCH_SIZE samples
-        if (i + 1) % BATCH_SIZE == 0:
-            temp_output = output_json_abs.replace(".json", f"_temp_{i+1}.json")
-            with open(temp_output, "w") as f:
-                json.dump({"samples": conversational_samples}, f, indent=2)
+                    pbar.update(1)
+
+                except Exception as e:
+                    print(f"\nError processing sample: {e}")
+                    pbar.update(1)
 
     # Save final output
     output_data = {
@@ -245,7 +272,7 @@ def process_transcriptions():
             "source": input_json_abs,
             "total_samples": len(conversational_samples),
             "original_transcriptions": len(samples),
-            "avg_pairs_per_audio": len(conversational_samples) / len(samples),
+            "avg_pairs_per_audio": len(conversational_samples) / len(samples) if samples else 0,
         }
     }
 

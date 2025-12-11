@@ -55,6 +55,9 @@ class SpeechTextDataset(Dataset):
         self.max_text_length = max_text_length
         self.system_prompt = system_prompt or "Transcribe the following audio:"
 
+        # Store data_path directory for resolving relative audio paths
+        self.data_dir = os.path.dirname(os.path.abspath(data_path)) if os.path.isfile(data_path) else os.path.abspath(data_path)
+
         self.samples = self._load_data(data_path)
 
     def _load_data(self, data_path: str) -> List[Dict[str, str]]:
@@ -124,8 +127,11 @@ class SpeechTextDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
 
-        # Load audio
+        # Load audio - handle both absolute and relative paths
         audio_path = sample["audio_path"]
+        if not os.path.isabs(audio_path):
+            # Relative path - resolve from JSON file directory
+            audio_path = os.path.join(self.data_dir, audio_path)
         waveform = self._load_audio(audio_path)
 
         # Extract audio features (mel spectrogram)
