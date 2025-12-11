@@ -12,3 +12,4 @@ wandb>=0.15.0
 torchcodec
 kernels
 openai
+python-dotenv

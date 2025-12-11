@@ -2,47 +2,51 @@
 """
 Dataset preparation script for VyvoOmni.
 
-Converts HuggingFace datasets with audio-text columns to VyvoOmni JSON format.
+Converts HuggingFace datasets to VyvoOmni JSON format with relative paths.
 
 Usage:
-    1. Edit the configuration variables below
-    2. Run: python prepare_dataset.py
+    python prepare_dataset.py
 """
 
 import os
 import json
+import logging
 import soundfile as sf
 from tqdm import tqdm
 from datasets import load_dataset, Audio
 
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
 # ============================================================================
-# CONFIGURATION - Edit these variables
+# CONFIGURATION
 # ============================================================================
 
-# HuggingFace dataset settings
-DATASET_NAME = "parler-tts/mls_eng_10k"  # HF dataset name or path
-DATASET_CONFIG = None  # Set to None if dataset has no config (only "default")
-DATASET_SPLIT = "train"  # Split to use: "train", "test", "validation"
+# Dataset settings
+DATASET_NAME = "parler-tts/mls_eng_10k"
+DATASET_CONFIG = None
+DATASET_SPLIT = "train"
 
-# Column names in the dataset
-AUDIO_COLUMN = "audio"  # Column containing audio data
-TEXT_COLUMN = "transcript"  # Column containing transcription text
+# Column names
+AUDIO_COLUMN = "audio"
+TEXT_COLUMN = "transcript"
 
 # Output settings
-OUTPUT_DIR = "./data"  # Directory to save audio files and JSON
-OUTPUT_JSON = "train.json"  # Output JSON filename
+OUTPUT_DIR = "../../data"
+OUTPUT_JSON = "train.json"
 
-# Task configuration (following OmniAudio format)
-TASK_TOKEN = "<|transcribe|>"  # Task token for transcription
-INSTRUCTION_TEXT = ""  # Empty instruction for transcription task
+# Task configuration
+TASK_TOKEN = "<|transcribe|>"
+INSTRUCTION_TEXT = ""
 
 # Audio settings
-TARGET_SAMPLE_RATE = 16000  # Whisper expects 16kHz
-MAX_SAMPLES = None  # Limit number of samples (None = use all)
+TARGET_SAMPLE_RATE = 16000
+MAX_SAMPLES = None
 
 # Train/eval split
-EVAL_SPLIT_RATIO = 0.1  # Fraction for evaluation set (0.1 = 10%)
-CREATE_EVAL_SPLIT = True  # Whether to create separate eval JSON
+EVAL_SPLIT_RATIO = 0.1
+CREATE_EVAL_SPLIT = True
 
 # ============================================================================
 # PROCESSING - Don't edit below unless you know what you're doing
@@ -52,111 +56,83 @@ CREATE_EVAL_SPLIT = True  # Whether to create separate eval JSON
 def process_dataset():
     """Process HuggingFace dataset and create VyvoOmni JSON format."""
 
-    print("=" * 60)
-    print("VyvoOmni Dataset Preparation")
-    print("=" * 60)
-    print(f"Dataset: {DATASET_NAME}")
-    print(f"Config: {DATASET_CONFIG}")
-    print(f"Split: {DATASET_SPLIT}")
-    print(f"Output: {OUTPUT_DIR}")
-    print("=" * 60)
+    logger.info(f"Dataset: {DATASET_NAME}")
+    logger.info(f"Output: {OUTPUT_DIR}")
 
-    # Create output directory
-    audio_dir = os.path.join(OUTPUT_DIR, "audio")
+    # Get absolute paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir_abs = os.path.abspath(os.path.join(script_dir, OUTPUT_DIR))
+    audio_dir = os.path.join(output_dir_abs, "audio")
     os.makedirs(audio_dir, exist_ok=True)
 
     # Load dataset
-    print("\nLoading dataset...")
+    logger.info("Loading dataset...")
     if DATASET_CONFIG:
         dataset = load_dataset(DATASET_NAME, DATASET_CONFIG, split=DATASET_SPLIT)
     else:
         dataset = load_dataset(DATASET_NAME, split=DATASET_SPLIT)
 
-    # Cast audio column to correct format
     dataset = dataset.cast_column(AUDIO_COLUMN, Audio(sampling_rate=TARGET_SAMPLE_RATE))
 
-    # Limit samples if specified
-    if MAX_SAMPLES is not None:
+    if MAX_SAMPLES:
         dataset = dataset.select(range(min(MAX_SAMPLES, len(dataset))))
 
-    print(f"Total samples: {len(dataset)}")
+    logger.info(f"Total: {len(dataset):,} samples")
 
     # Process samples
     samples = []
-    print("\nProcessing samples...")
-
-    for idx, item in enumerate(tqdm(dataset, desc="Processing")):
+    for idx, item in enumerate(tqdm(dataset, desc="Processing", ncols=80)):
         try:
-            # Get audio data
             audio_data = item[AUDIO_COLUMN]
             audio_array = audio_data["array"]
             sample_rate = audio_data["sampling_rate"]
 
-            # Get text
             text = item[TEXT_COLUMN]
             if not text or not text.strip():
                 continue
 
-            # Save audio file
             audio_filename = f"audio_{idx:06d}.wav"
             audio_path = os.path.join(audio_dir, audio_filename)
-
             sf.write(audio_path, audio_array, sample_rate)
 
-            # Add to samples (OmniAudio format with task token)
+            # Use relative path (relative to JSON location)
+            rel_audio_path = os.path.join("audio", audio_filename)
             samples.append({
-                "audio_path": os.path.abspath(audio_path),
+                "audio_path": rel_audio_path,
                 "task_token": TASK_TOKEN,
                 "instruction": INSTRUCTION_TEXT,
                 "response": text.strip(),
             })
 
         except Exception as e:
-            print(f"\nError processing sample {idx}: {e}")
+            logger.error(f"Error {idx}: {e}")
             continue
 
-    print(f"\nSuccessfully processed {len(samples)} samples")
+    logger.info(f"Processed: {len(samples):,} samples")
 
-    # Split into train/eval if requested
+    # Save JSONs
     if CREATE_EVAL_SPLIT and EVAL_SPLIT_RATIO > 0:
         split_idx = int(len(samples) * (1 - EVAL_SPLIT_RATIO))
         train_samples = samples[:split_idx]
         eval_samples = samples[split_idx:]
 
-        # Save train JSON (OmniAudio format - no system_prompt field)
-        train_data = {
-            "samples": train_samples,
-        }
-        train_json_path = os.path.join(OUTPUT_DIR, OUTPUT_JSON)
+        train_json_path = os.path.join(output_dir_abs, OUTPUT_JSON)
         with open(train_json_path, "w", encoding="utf-8") as f:
-            json.dump(train_data, f, ensure_ascii=False, indent=2)
-        print(f"Train JSON saved: {train_json_path} ({len(train_samples)} samples)")
-        print(f"  Using OmniAudio format with task token: {TASK_TOKEN}")
+            json.dump({"samples": train_samples}, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ Train: {len(train_samples):,} samples")
 
-        # Save eval JSON (OmniAudio format - no system_prompt field)
-        eval_data = {
-            "samples": eval_samples,
-        }
-        eval_json_path = os.path.join(OUTPUT_DIR, OUTPUT_JSON.replace(".json", "_eval.json"))
+        eval_json_path = os.path.join(output_dir_abs, OUTPUT_JSON.replace(".json", "_eval.json"))
         with open(eval_json_path, "w", encoding="utf-8") as f:
-            json.dump(eval_data, f, ensure_ascii=False, indent=2)
-        print(f"Eval JSON saved: {eval_json_path} ({len(eval_samples)} samples)")
-        print(f"  Using OmniAudio format with task token: {TASK_TOKEN}")
+            json.dump({"samples": eval_samples}, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ Eval: {len(eval_samples):,} samples")
 
     else:
-        # Save single JSON (OmniAudio format - no system_prompt field)
-        data = {
-            "samples": samples,
-        }
-        json_path = os.path.join(OUTPUT_DIR, OUTPUT_JSON)
+        json_path = os.path.join(output_dir_abs, OUTPUT_JSON)
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"JSON saved: {json_path} ({len(samples)} samples)")
-        print(f"  Using OmniAudio format with task token: {TASK_TOKEN}")
+            json.dump({"samples": samples}, f, ensure_ascii=False, indent=2)
+        logger.info(f"✓ Saved: {len(samples):,} samples")
 
-    print("\n" + "=" * 60)
-    print("Dataset preparation complete!")
-    print("=" * 60)
+    logger.info("Done!")
 
 
 if __name__ == "__main__":
