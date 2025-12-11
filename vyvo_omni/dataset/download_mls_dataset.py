@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-Download MLS-eng dataset (audio + JSON).
-
-Audio: parler-tts/mls_eng_10k
-JSON: Vyvo-Research/Omni-Mls-Json
-
-Usage:
-    python download_mls_dataset.py
-"""
-
 import os
 import logging
 import soundfile as sf
@@ -30,45 +19,49 @@ JSON_DATASET = "Vyvo-Research/Omni-Mls-Json"
 DATASET_SPLIT = "train"
 
 # Output settings
-DATA_DIR = "./data"
-AUDIO_DIR = "./data/audio"
+DATA_DIR = "../../data"
+AUDIO_DIR = "../../data/audio"
 
 # Audio settings
 TARGET_SAMPLE_RATE = 16000
 MAX_SAMPLES = None
+
+# Download settings
+MAX_WORKERS = 16  # Parallel download threads
 
 # ============================================================================
 # MAIN SCRIPT
 # ============================================================================
 
 
-def download_json_files():
-    """Download JSON files from HF Hub."""
+def extract_json_files():
+    """Extract JSON files from HF Hub cache to local directory."""
 
-    logger.info("Downloading JSON files...")
-    os.makedirs(DATA_DIR, exist_ok=True)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir_abs = os.path.abspath(os.path.join(script_dir, DATA_DIR))
+    os.makedirs(data_dir_abs, exist_ok=True)
 
-    files = ["train.json", "train_eval.json"]
+    files = ["train.json", "train_eval.json", "train_conversational.json"]
 
     for filename in files:
-        logger.info(f"  {filename}")
         hf_hub_download(
             repo_id=JSON_DATASET,
             filename=filename,
             repo_type="dataset",
-            local_dir=DATA_DIR,
+            local_dir=data_dir_abs,
         )
 
-    logger.info("✓ JSON files downloaded")
+    logger.info("✓ JSON extracted")
 
 
-def download_audio_files():
-    """Download audio files from HF dataset."""
+def extract_audio_files():
+    """Extract audio files from cached dataset."""
 
-    logger.info("Downloading audio files...")
-    os.makedirs(AUDIO_DIR, exist_ok=True)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    audio_dir_abs = os.path.abspath(os.path.join(script_dir, AUDIO_DIR))
+    os.makedirs(audio_dir_abs, exist_ok=True)
 
-    # Load dataset
+    # Load from cache
     dataset = load_dataset(AUDIO_DATASET, split=DATASET_SPLIT)
     dataset = dataset.cast_column("audio", Audio(sampling_rate=TARGET_SAMPLE_RATE))
 
@@ -77,7 +70,7 @@ def download_audio_files():
 
     logger.info(f"Total: {len(dataset):,} samples")
 
-    # Save audio files
+    # Extract audio files
     saved = 0
     for idx, item in enumerate(tqdm(dataset, desc="Audio", ncols=80)):
         try:
@@ -86,7 +79,7 @@ def download_audio_files():
             sample_rate = audio_data["sampling_rate"]
 
             audio_filename = f"audio_{idx:06d}.wav"
-            audio_path = os.path.join(AUDIO_DIR, audio_filename)
+            audio_path = os.path.join(audio_dir_abs, audio_filename)
 
             sf.write(audio_path, audio_array, sample_rate)
             saved += 1
@@ -95,20 +88,16 @@ def download_audio_files():
             logger.error(f"Error {idx}: {e}")
             continue
 
-    logger.info(f"✓ Saved {saved:,} audio files")
+    logger.info(f"✓ {saved:,} files saved")
 
 
 def main():
-    """Download dataset (JSON + audio)."""
+    """Process and extract dataset files from HF cache."""
 
-    logger.info(f"Audio: {AUDIO_DATASET}")
-    logger.info(f"JSON: {JSON_DATASET}")
-    logger.info(f"Output: {DATA_DIR}")
+    extract_json_files()
+    extract_audio_files()
 
-    download_json_files()
-    download_audio_files()
-
-    logger.info("Done! Start training: python train.py")
+    logger.info("Done! Next: cd ../.. && python train.py")
 
 
 if __name__ == "__main__":
