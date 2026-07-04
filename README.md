@@ -1,36 +1,117 @@
 # omni
 
-A speech-to-speech LLM trained from scratch. It listens (audio in), thinks (text
-inner monologue), and speaks (audio out) — emotion-aware and multilingual.
+A speech-to-speech LLM. It **listens** (audio in), **thinks** (a text inner
+monologue), and **speaks** (audio out) — emotion-aware, multilingual, and able
+to hold a speaker's voice across every language.
 
-- Reference-audio voice cloning: one speaker voice, held across every language
-  (`--voice ref.wav`; one-time ~6 ms prefill, per-frame decode unchanged).
-- One decoder-only transformer over parallel token streams at 12.5 Hz:
-  **1 text stream + N audio streams** ([kyutai/mimi](https://huggingface.co/kyutai/mimi)
-  codec tokens). The only pretrained part is the frozen codec.
-- ASR, TTS, speech continuation, text LM, spoken dialogue (s2s), and full-duplex
-  are all the **same grid format** with different columns masked.
-- Runs fully offline on CPU with `FakeCodec` for development; trains with
-  DDP/FSDP2 on a GPU node.
+The whole model is one decoder-only transformer running at **12.5 Hz** over
+parallel token streams:
 
-Design docs: [architecture](docs/DESIGN.md) ·
-[audio quality (32-codebook + depth)](docs/DESIGN_V3_AUDIO.md) ·
+```
+                one 80 ms frame ─┐
+                                 ▼
+  text   │ <s2s> <assistant> <lang_en> <calm>  w1   w2   w3  ...   ← the model thinks in text
+  audio1 │  •     •     c c c  c c c  c c c  c c c  c c c  ...     ← Mimi codec tokens
+  audio2 │  •     •     c c c  c c c  c c c  c c c  c c c  ...
+   ...   │                    (N codebooks)
+```
+
+One text stream carries the inner monologue and control tags; N audio streams
+carry [Mimi](https://huggingface.co/kyutai/mimi) codec tokens. **Every task —
+ASR, TTS, speech continuation, text LM, spoken dialogue (s2s), full-duplex — is
+the same grid** with different rows masked out of the loss. The only pretrained,
+frozen piece is the audio codec.
+
+Two backbones share every other module:
+
+- **From scratch** (`OmniModel`) — trained end to end; used for tiny CPU tests and ablations.
+- **Pretrained backbone** (`HFOmniModel`, *v6*) — mounts a frozen Qwen3 / Llama 3 / Gemma
+  as the temporal transformer, so you skip text pretraining and train only the audio side.
+
+Runs fully **offline on CPU** for development (a `FakeCodec` stands in for Mimi);
+scales to **8 GPUs** with automatic DDP / FSDP2 for real training.
+
+📄 Design docs: [architecture](docs/DESIGN.md) ·
+[audio quality](docs/DESIGN_V3_AUDIO.md) ·
 [emotion + multilingual](docs/DESIGN_V4_EMOTION_I18N.md) ·
 [voice cloning](docs/DESIGN_V5_VOICE.md) ·
+[pretrained backbone](docs/DESIGN_V6_PRETRAINED_BACKBONE.md) ·
 [module APIs](docs/INTERFACES.md)
+
+---
 
 ## Install
 
 ```bash
 uv venv .venv --python 3.12
 uv pip install -p .venv/bin/python -e ".[dev]"
-.venv/bin/pytest          # 138 tests, CPU, no downloads
+.venv/bin/pytest          # 264 tests · CPU · fully offline, nothing downloads
 ```
 
-## Data format
+## Try it in 3 commands
 
-**1. What you feed in** — dialogues as plain dicts (JSONL-friendly). Emotion and
-language labels are optional per turn:
+No GPU, no downloads — a tiny model end to end on fake data:
+
+```bash
+# 1. make offline demo shards (FakeCodec + a sine-wave TTS)
+.venv/bin/python scripts/prepare_data.py fake --n 256 --out data/shards/fake \
+    --preset tiny model.n_codebooks=2 model.text_vocab_size=320
+
+# 2. train + export a ~22M model
+.venv/bin/python scripts/train.py --preset tiny --data data/shards/fake \
+    model.n_codebooks=2 model.text_vocab_size=320 data.num_workers=0 \
+    train.max_steps=200 --export checkpoints/tiny
+
+# 3. speak some text
+.venv/bin/python scripts/chat.py --task tts --text "hello" --out hello.wav \
+    --ckpt checkpoints/tiny --codec fake --tokenizer byte
+```
+
+Every script takes `--preset <name>` plus dotted overrides like
+`model.n_codebooks=2 train.max_steps=20`.
+
+---
+
+## How it works
+
+### The grid
+
+A sample is a grid of `[S, T]` integers, where `S = 1 + n_codebooks` streams and
+each column `T` is one 80 ms frame:
+
+```
+row 0        text     <bos> <s2s> <user> ..user speech.. <end_of_turn>
+                      <assistant> <lang_en> <emo_pcv> <angry> <emo_rsp> <calm> w1 w2 ...
+rows 1..N    audio    Mimi codebook tokens, one column = one frame
+loss_mask             which positions are training targets (user speech is input-only)
+channel               who owns the turn (user / assistant)
+```
+
+Logits at position `p` predict position `p+1`; the `loss_mask` decides which
+targets count. Want ASR? Mask everything but the text. Want TTS? Mask everything
+but the audio. Same model, same code path.
+
+### The delay trick
+
+Grids on disk are **undelayed** — every codebook of frame `t` sits in column `t`.
+The MusicGen-style per-codebook delay (`streams.apply_delay`) is applied **at
+batch time**, so you can change the delay pattern without re-tokenizing a single
+shard. The model and generator always see delayed grids.
+
+### Control tags live in the text
+
+Emotion, language, and paralinguistics are just special text tokens (ids 0..63
+are reserved; real text starts at 64). The model reads your tone
+(`<emo_pcv> <angry>`), picks a register (`<emo_rsp> <calm>`), and names a
+language (`<lang_en>`) *in its monologue, before it speaks* — all inspectable and
+all overridable.
+
+---
+
+## Prepare data
+
+You feed in plain dialogue dicts (JSONL-friendly); emotion + language are
+optional per turn:
 
 ```json
 {"turns": [
@@ -40,56 +121,41 @@ language labels are optional per turn:
 ]}
 ```
 
-**2. What training reads** — binary shard dirs. Each sample is one token grid:
-
-```
-row 0        : text    <bos> <s2s> <user> ..user speech.. <end_of_turn>
-                       <assistant> <lang_en> <emo_pcv> <angry> <emo_rsp> <calm> w1 w2 ...
-rows 1..N    : audio   Mimi codebook tokens, one column = one 80 ms frame
-loss_mask    : which positions train (user speech is input-only)
-channel      : who is speaking (user / assistant)
-```
-
-On disk: `shard-00000.bin` (grid `uint16 [S,T]` + mask `uint8 [S,T]` + channel
-`uint8 [T]` per sample), `shard-00000.idx.jsonl` (byte offsets), `meta.json`
-(`n_codebooks`, `codec_vocab`, `text_vocab_size`, `duplex`). Grids are stored
-undelayed; the codebook delay pattern is applied at batch time, so changing it
-never invalidates data.
-
-## Prepare data
+Prep writes binary shards (`shard-00000.bin` + `.idx.jsonl` + `meta.json`). Each
+task has its own prep command:
 
 ```bash
-# offline demo shards (no network, FakeCodec + SineTTS): all tasks incl. s2s
+# offline demo (no network) — all tasks incl. s2s
 .venv/bin/python scripts/prepare_data.py fake --n 256 --out data/shards/fake \
     --preset tiny model.n_codebooks=2 model.text_vocab_size=320
-
-# tokenizer (once, for real runs): 48k multilingual byte-BPE
-.venv/bin/python scripts/train_tokenizer.py --dataset HuggingFaceFW/fineweb-edu:sample-10BT \
-    --vocab-size 48000 --out data/tokenizer/omni_bpe.json
 
 # text pretraining rows (Stage A)
 .venv/bin/python scripts/prepare_data.py textlm --dataset HuggingFaceFW/fineweb-edu \
     --name sample-10BT --max-samples 100000 --lang en \
     --tokenizer data/tokenizer/omni_bpe.json --out data/shards/textlm --preset quality
 
-# ASR/TTS/audio-LM from a speech corpus (Stage B); --emotion-column makes SER-tagged ASR
+# ASR / TTS / speech-LM from a speech corpus (Stage B)
 .venv/bin/python scripts/prepare_data.py asr --dataset openslr/librispeech_asr --name clean \
     --split train.100 --max-samples 20000 --codec mimi --lang en \
     --tokenizer data/tokenizer/omni_bpe.json --out data/shards/speech --preset quality
 
 # spoken dialogues (Stage C): text dialogues -> TTS -> Mimi tokens
-# emotion labels ride the dialogue dicts (--dialogues soda-emotional maps SODA's
-# emotion field); assistant audio is voiced with the labeled style
 .venv/bin/python scripts/prepare_data.py s2s --dialogues soda-emotional --tts vibevoice \
     --codec mimi --max-samples 50000 --tokenizer data/tokenizer/omni_bpe.json \
     --out data/shards/s2s --preset quality
-
-# full-duplex conversations (optional)
-.venv/bin/python scripts/prepare_data.py duplex --n 200 --out data/shards/duplex \
-    --preset tiny model.duplex=true model.text_vocab_size=320
 ```
 
-Or from Python:
+The 48k multilingual BPE tokenizer is a one-time build (skip it entirely if you
+use a pretrained backbone — see below):
+
+```bash
+.venv/bin/python scripts/train_tokenizer.py \
+    --dataset HuggingFaceFW/fineweb-edu:sample-10BT \
+    --vocab-size 48000 --out data/tokenizer/omni_bpe.json
+```
+
+<details>
+<summary>Same thing from Python</summary>
 
 ```python
 from omni.audio.codec import FakeCodec
@@ -101,13 +167,15 @@ from omni.text.tokenizer import ByteTokenizer
 cfg = load_config("tiny", ["model.n_codebooks=2", "model.text_vocab_size=320",
                            "data.batch_size=2"])
 dialogues = [{"turns": [{"user": "hello there", "assistant": "hi, how can I help",
-                         "user_emotion": "happy", "response_style": "calm",
-                         "lang": "en"}]}]
+                         "user_emotion": "happy", "response_style": "calm", "lang": "en"}]}]
 dialogues += list(fake_dialogues(15, seed=0))
 prepare_s2s("data/shards/demo", dialogues=dialogues, tts=SineTTS(),
             codec=FakeCodec(n_codebooks=2), tokenizer=ByteTokenizer(),
             cfg=cfg, max_samples=16)
 ```
+</details>
+
+---
 
 ## Train
 
@@ -117,14 +185,29 @@ prepare_s2s("data/shards/demo", dialogues=dialogues, tts=SineTTS(),
     model.n_codebooks=2 model.text_vocab_size=320 data.num_workers=0 \
     train.max_steps=200 --export checkpoints/tiny
 
-# 8 GPUs: same script; <300M params uses DDP, larger uses FSDP2 automatically.
-# --data DIR:WEIGHT mixes shard dirs; checkpoints resume automatically.
+# 8 GPUs — same script. <300M params -> DDP, larger -> FSDP2, chosen automatically.
+# --data DIR:WEIGHT mixes shard dirs; checkpoints resume on their own.
 torchrun --standalone --nproc_per_node=8 scripts/train.py --preset quality \
     --data data/shards/s2s:0.6 --data data/shards/speech:0.25 --data data/shards/textlm:0.15 \
     --export checkpoints/quality
 ```
 
-Or from Python:
+Add `train.wandb=true` to any train command to stream per-head losses, lr,
+grad-norm, and throughput to Weights & Biases; resuming a checkpoint resumes the
+*same* run (`pip install 'omni[wandb]'`).
+
+### Presets
+
+| Preset | Size | Where | Notes |
+|---|---|---|---|
+| `tiny` | ~22M | CPU | smoke tests, wiring demos |
+| `small` | ~0.3B | 1 GPU | ablations (32 codebooks + depth transformer) |
+| `quality` | ~1.0B | 8 GPU | from-scratch flagship |
+| `base` | 0.76B | 8 GPU | legacy 8-codebook path |
+| `qwen3-1.7b` `qwen3-8b` `llama32-3b` `gemma3-4b` | backbone | 1–8 GPU | **v6 pretrained backbone** |
+
+<details>
+<summary>Same thing from Python</summary>
 
 ```python
 from omni.config import load_config
@@ -138,75 +221,74 @@ cfg = load_config("tiny", ["model.n_codebooks=2", "model.text_vocab_size=320",
 model = OmniModel(cfg.model)
 model.init_weights()
 trainer = Trainer(cfg, model, build_dataloader(cfg, ["data/shards/demo"]))
-metrics = trainer.fit()            # logs loss per head (text + each codebook)
+trainer.fit()                                # logs loss per head (text + each codebook)
 trainer.export_model("checkpoints/demo-export")
 ```
+</details>
 
-W&B logging: add `train.wandb=true` (plus optional `train.wandb_project=...`
-`train.wandb_run_name=...` `train.wandb_mode=offline`) to any train command —
-per-head losses, lr, grad-norm, and throughput stream to the run, and resuming
-a checkpoint resumes the *same* wandb run (`pip install 'omni[wandb]'`).
+### Pretrained backbone (v6) — skip text pretraining
 
-Presets (`--preset`): `tiny` ~22M CPU tests · `small` ~0.3B 1-GPU ·
-`quality` ~1.0B 8-GPU from-scratch · `base` 0.76B legacy ·
-**`qwen3-1.7b` / `qwen3-8b` / `llama32-3b` / `gemma3-4b`** — pretrained-LLM
-backbones (the v6 production path). Stage recipe and mixtures:
-[docs/DESIGN.md](docs/DESIGN.md) §4 (from scratch) /
-[docs/DESIGN_V6](docs/DESIGN_V6_PRETRAINED_BACKBONE.md) §5 (backbone).
+Instead of pretraining a text LM, mount a pretrained decoder as the temporal
+backbone. Its tokenizer rides the text stream shifted by +64
+(`--tokenizer hf:<model_id>`); new audio embeddings and the depth transformer are
+grafted on. Training becomes two cheap stages:
 
-## Pretrained backbone (v6): skip text pretraining
+1. **Align** — backbone frozen (`model.freeze_backbone=true`, the default), train only the audio modules.
+2. **Finetune** — unfreeze at a low LR (`train.backbone_lr`) or use LoRA (`model.lora_rank=32`, needs `pip install 'omni[lora]'`).
 
-Instead of pretraining a text LM, mount a pretrained decoder (Qwen3 / Llama 3 /
-Gemma) as the temporal backbone: its tokenizer rides the text stream shifted by
-+64 (`--tokenizer hf:<model_id>`, omni specials keep ids 0..63), new audio
-embeddings + the depth transformer are grafted on, and training becomes two
-cheap stages — Stage 1 aligns the new audio modules with the backbone FROZEN
-(`model.freeze_backbone=true`, the default), Stage 2 unfreezes at a low LR
-(`train.backbone_lr`) or uses LoRA (`model.lora_rank=32`, needs
-`pip install 'omni[lora]'`). Exports write `adapters.safetensors` only — the
-backbone is referenced by id, not copied.
+Exports write `adapters.safetensors` only — the backbone is referenced by id, not copied.
 
 ```bash
-# prepare with the backbone tokenizer (downloads tokenizer + model on first use)
+# prepare with the backbone tokenizer (downloads the model on first use)
 .venv/bin/python scripts/prepare_data.py asr --dataset openslr/librispeech_asr \
     --name clean --split train.100 --codec mimi --lang en \
     --tokenizer hf:Qwen/Qwen3-1.7B-Base --out data/shards/speech --preset qwen3-1.7b
 
-# Stage 1: frozen backbone, align audio modules (single GPU is fine at 1.7B)
+# Stage 1: frozen backbone (a single GPU is fine at 1.7B)
 .venv/bin/python scripts/train.py --preset qwen3-1.7b --data data/shards/speech \
     --export checkpoints/qwen3-s1
 
-# Stage 2: unfreeze at low LR on the s2s + emotion mixture (8 GPUs)
+# Stage 2: unfreeze at low LR on the s2s + speech mixture
 torchrun --standalone --nproc_per_node=8 scripts/train.py --preset qwen3-8b \
     model.freeze_backbone=false --data data/shards/s2s:0.7 --data data/shards/speech:0.3 \
     --export checkpoints/qwen3-s2
 ```
 
-Every other command (chat, serve, benchmark) takes the exported dir via
-`--ckpt` unchanged. Design + rationale: [docs/DESIGN_V6](docs/DESIGN_V6_PRETRAINED_BACKBONE.md).
+Chat, serve, and benchmark take the exported dir via `--ckpt` unchanged.
+
+---
 
 ## Inference
 
 ```bash
-# speak text / transcribe / spoken reply (use --codec mimi with real checkpoints)
+# text -> speech
 .venv/bin/python scripts/chat.py --task tts --text "hello" --out hello.wav \
     --ckpt checkpoints/demo-export --codec fake --tokenizer byte
+
+# speech -> text
 .venv/bin/python scripts/chat.py --task asr --in hello.wav \
     --ckpt checkpoints/demo-export --codec fake --tokenizer byte
+
+# spoken reply, with an emotion register and a cloned voice
 .venv/bin/python scripts/chat.py --task s2s --in question.wav --out reply.wav \
     --ckpt checkpoints/demo-export --codec fake --tokenizer byte \
     --emotion calm --lang en \
-    --voice me.wav                    # optional: 10s reference wav pins the speaker
-                                      # voice — held across ALL languages
+    --voice me.wav          # 10s reference wav pins the speaker voice across ALL languages
+
+# full-duplex (mic and model on the same clock)
 .venv/bin/python scripts/chat.py --task duplex --in user.wav --out assistant.wav \
     --ckpt checkpoints/duplex-export --codec fake --tokenizer byte
 ```
 
-Or from Python:
+Use `--codec mimi` with real checkpoints. Voice cloning is a one-time ~6 ms
+reference-audio prefill; per-frame decode is unchanged.
+
+<details>
+<summary>Same thing from Python</summary>
 
 ```python
 import torch
-from omni.audio.codec import FakeCodec, save_wav   # build_codec("mimi") for real runs
+from omni.audio.codec import FakeCodec, save_wav      # build_codec("mimi") for real runs
 from omni.config import load_config
 from omni.infer.generate import OmniGenerator
 from omni.model.omni import OmniModel
@@ -215,43 +297,44 @@ from omni.text.tokenizer import ByteTokenizer
 
 model = OmniModel.from_pretrained("checkpoints/demo-export")
 cfg = load_config("tiny")
-cfg.model = model.cfg                              # keep checks coherent with weights
+cfg.model = model.cfg                                 # keep checks coherent with weights
 codec = FakeCodec(n_codebooks=model.cfg.n_codebooks)
 gen = OmniGenerator(model, cfg, device="cpu", tokenizer=ByteTokenizer())
 
-gen.set_voice(torch.randn(codec.sample_rate * 5).clamp(-1, 1), codec)  # reference wav
-wav = torch.sin(torch.linspace(0, 500, codec.samples_per_frame * 10))  # your mic audio
+gen.set_voice(torch.randn(codec.sample_rate * 5).clamp(-1, 1), codec)   # reference wav
+wav = torch.sin(torch.linspace(0, 500, codec.samples_per_frame * 10))   # your mic audio
 reply = gen.s2s(wav, codec, seed=0,
                 prefix_ids=turn_prefix(lang="en", response_style="calm"))
-print(reply.text)                                  # inner monologue (specials stripped)
+print(reply.text)                                     # the inner monologue (specials stripped)
 save_wav("reply.wav", codec.decode(reply.audio_codes), codec.sample_rate)
 ```
+</details>
 
-The model's monologue starts with its own read of your tone
-(`<emo_pcv> <angry>`) and the register it chose (`<emo_rsp> <calm>`) before the
-words — inspect `reply.text_ids`, or override the register with `prefix_ids`.
+---
 
-## Test console (streaming UI)
+## Streaming console
 
 ```bash
 uv pip install -p .venv/bin/python -e ".[serve]"
 .venv/bin/python scripts/serve.py --ckpt checkpoints/quality-export --codec mimi \
-    --tokenizer data/tokenizer/omni_bpe.json          # or: --preset tiny (wiring demo)
-# -> open http://127.0.0.1:7860
+    --tokenizer data/tokenizer/omni_bpe.json      # or just --preset tiny for a wiring demo
+# -> http://127.0.0.1:7860
 ```
 
-Pick a task, talk or type, and the reply **streams**: audio plays as frames are
-generated, the inner monologue appears live (control tags render as chips — you
-watch the model pick a language and emotion before it speaks), and a per-frame
-budget meter shows every frame's latency against the 80 ms real-time line,
-with TTFA / ms-per-frame / realtime-× readouts. Reference-voice and duplex
-(mic-to-model, same clock) modes included. Local tool — binds to 127.0.0.1,
-no auth.
+Pick a task, talk or type, and watch the reply **stream**: audio plays as frames
+are generated, the inner monologue appears live (control tags render as chips —
+you see the model choose a language and emotion before it speaks), and a
+per-frame budget meter tracks latency against the 80 ms real-time line
+(TTFA / ms-per-frame / realtime-× readouts). Reference-voice and duplex modes
+included. Local tool — binds to `127.0.0.1`, no auth.
+
+---
 
 ## Status
 
-Code-complete and contract-tested on CPU (100 tests, offline). Needs a GPU box
-for: the 48k tokenizer run, per-language codec Gate-0, and the Stage A→D
-training campaign. Remaining engineering queue (depth compute amortization, CFG
-decode, eval battery, synthesis QC, DPO): see the implementation queues in
-[DESIGN_V3](docs/DESIGN_V3_AUDIO.md) / [DESIGN_V4](docs/DESIGN_V4_EMOTION_I18N.md).
+Code-complete and contract-tested on CPU (264 tests, fully offline). A GPU box is
+needed for the 48k tokenizer run, per-language codec validation, and the
+Stage A→D training campaign. Remaining engineering (depth-compute amortization,
+CFG decode, eval battery, synthesis QC, DPO) is tracked in the implementation
+queues of [DESIGN_V3](docs/DESIGN_V3_AUDIO.md) and
+[DESIGN_V4](docs/DESIGN_V4_EMOTION_I18N.md).
